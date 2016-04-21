@@ -1,0 +1,864 @@
+#!/usr/bin/env python
+#
+#
+# Nathan Long
+# Jake Mingolla
+# 
+# Comp 150 IDS
+# Spring 2016
+#
+# rpcgenerate
+#
+# This program can generate proxy and stub files for any IDL file. These files
+# are used to create client and server code to implement an RPC model of
+# computation. For a full description and syntax of the language, please see
+# the assignment sheet.
+
+# IMPORTS
+#
+# Used for parsing the JSON using the idl_to_Json
+import subprocess
+import json
+import sys
+import os
+
+# GLOBAL VARIABLES
+#
+# decls holds the parsed IDL tree in a dictionary form after it has been parsed
+# from the ILD file. It follows the exact same hierarchy, with 'types' and
+# 'functions' being the upper most keys.
+#
+# NOTE: In addition to all of the JSON information created from running
+#       idl_to_json, we have augmented the data structure by adding a 
+#       field called 'num_locally_unique' to each of the meta-information
+#       associated with a type. This can be used to both calculate the number
+#       of locally unique placeholders in a user defined struct by summing
+#       the number of locally unique placeholders within its components and 
+#       also to figure out when it is time to get a template in the global
+#       scope how many $UNIQUE_N$ placeholders to substitute.
+#
+#       We have also added a field called 'unique_name' to the signature of
+#       each function within the declarations. This allows us to alias the
+#       function the stub calls with a globally unique variable name while
+#       still refering to the original user defined function.
+decls = {}
+# This holds the declarations in string format to check for uniqueness of
+# globally unique variables generated at runtime.
+decls_str = ""
+
+# These dictionaries hold the locally unique templates for all types including
+# built-ins as well as user defined structs and arrays.
+#
+# A locally unique template is a defined a string with the following
+# properties:
+#   -   The string $PLACEHOLDER$ stores the placeholder for the final name of 
+#       an object instantiated from the template type.
+#
+#   -   The string $RPC_SOCKET$ must be set to either RPCPROXYSOCKET or
+#       RPCSTUBSOCKET depending on whether or not the template is resolved
+#       in the stub or the proxy.
+#
+#   -   One or more strings of the form $UNIQUE_N$, where N is a series of
+#       numbers starting at 0 to store variables that are locally unique to
+#       the template and must be substituted for globally unique variable names
+#       during runtime. It is an invariant that each $UNIQUE_N$ 
+#       series will begin at 0 and not skip any numbers. Thus, if a template
+#       has 3 locally unique placeholders, they will be $UNIQUE_0$, $UNIQUE_1$,
+#       and $UNIQUE_2$.
+#
+# The keys for this dictionary are the type names and the associated values
+# are the template. Because our use of TCP requires different templates for
+# sending and receiving objects of any type we have separate dictionaries.
+receive_template = {}
+send_template = {}
+
+# These strings store the C++ code that will be written to the proxy and stub,
+# respectively.
+proxy = ""
+stub = ""
+
+# This counter stores the current number of globally unique variable names that
+# have been generated to avoid collisions with any variable names the user has
+# defined as well as globally unique names already generated.
+counter = 0
+
+def main():
+    """ Main program for the invocation of rpcgenerate on a given idl file. """
+
+    # To begin, we must load the file and its IDL declarations in JSON form
+    # into a python dictionary. Note that using an invalid/missing IDL file
+    # will cause an exception to be thrown.
+    filename = get_filename()
+    load_decls(filename)
+
+    # This step avoids the degenerate case of structs with no members to
+    # prevent the network from being ignored.
+    augment_empty_structs()
+
+    # Handle all of the builtin types by adding their templates to both
+    # the send and receive template dictionaries and adding their number
+    # of locally unique placeholders to the declarations.
+    create_builtin_templates()
+    set_builtin_num_locally_unique()
+    
+    # Now that we have the templates and number of locally unique placeholder
+    # values for all of the builtin types for both sending and receiving, we
+    # can create all of the user defined (custom) templates by composing them
+    # of existing template information.
+    create_custom_templates()
+
+    # To begin handling the functions the user has defined, we must first
+    # assign globally unique aliases to each function in order for the stub
+    # to call the functions it generates.
+    assign_unique_function_names()
+
+    # We then add the default information to each of the files. This includes
+    # information like #include statements as well as namespace information.
+    add_defaults(filename)
+
+    # Then parse through each function declaration using the templates for 
+    # sending and receiving each of the arguments and return value by looking
+    # up their template based on type.
+    generate_functions()
+
+    # Finally, add the required footer to the stub function to handle the
+    # server's dispatch() function and other information and write both files.
+    add_stub_footer()
+    write_files(filename)
+
+def get_filename():
+    """ Gets the filename from the arguments passed to the function and returns
+        it to the caller. The filename must be the second argument.
+
+        It is an error to invoke rpcgenerate without exactly two arguments or
+        to specify an invalid IDL file. An IDL file is invalid if it does not 
+        exist or cannot be parsed by running the idl_to_json program on it.
+    """
+    try:
+        #     Make sure invoked properly
+        if len(sys.argv) != 2:
+            raise "Wrong number of arguments"
+
+        #     Make sure file exists and is readable
+        filename = sys.argv[1]
+        if (not os.path.isfile(filename)):
+            print >> sys.stderr, "Path %s does not designate a file" % filename
+            raise "No file named " + filename
+        if (not os.access(filename, os.R_OK)):
+            print >> sys.stderr, "File %s is not readable" % filename
+            raise "File " + filename + " not readable"
+
+        # If none of these conditions have triggered an exception to be thrown,
+        # return to the caller.
+        return filename
+    except Exception:
+        print >> sys.stderr, "Usage: %s <idlfilename>" % sys.argv[0]
+        
+
+def load_decls(filename):
+    """ Loads the declarations into a Python dictionary from JSON format. In addition,
+        this function will populate the declarations string by dumping the declarations
+        dictionary into string form.
+    """
+    global decls
+    global decls_str
+
+    # NOTE
+    # We remove all occurences of the '__' sequence for internal use.
+    # Please see the report HTML for further explanation.
+    decls = json.loads(subprocess.check_output(["idl_to_json", filename]).replace('__', ''))
+
+    decls_str = json.dumps(decls)
+
+def set_builtin_num_locally_unique():
+    """ Assigns the number of locally unique placeholder values for each builtin type.
+        
+        NOTE: These values are always an upper bound on the number of used variables. For
+        example, in the send template for a STRING, two locally unique variables are
+        created only to be casted to void to ignore them. This is included in the template
+        in order to avoid more complex logic to convert a locally unique template
+        into a globally unique scope.
+    """
+    decls['types']['int']['num_locally_unique'] = 1
+    decls['types']['float']['num_locally_unique'] = 1
+    decls['types']['void']['num_locally_unique'] = 1
+    decls['types']['string']['num_locally_unique'] = 2
+
+def create_builtin_templates():
+    """ For each builtin type, add the handmade template into both the send and receive
+        template dictionary. A template is essentially the instructions to how to send
+        or receive a single object of the specified type over the network. All data is
+        serialized as a string and goes across the TCP network through a write and
+        is read using a read.
+        
+        A template must be valid C++ code except that it may contain
+        the following placeholders to be substituted out before adding to the proxy or 
+        the stub:
+            $PLACEHOLDER$ -- This holds the place for the name of the variable of the
+                             type being sent.
+
+            $RPC_SOCKET$  -- This holds whether or not the RPC socket is of the RPCSTUBSOCKET
+                             or RPCPROXYSOCKET and must be set.
+
+            $UNIQUE_N$    -- These are any number of locally unique placeholders. The N value
+                             must start at 0 and must match the value of the number of
+                             locally unique placeholders specified in the declarations for
+                             a type. These must be swapped into globally unique variable names
+                             when the template is resolved in a global scope.
+
+
+        We have chosen to ignore indentation to streamline our design and
+        avoid corner cases. Instead, we conform to the convention that newlines must
+        be preserved in the final C++ code.
+    """
+    global receive_template
+    global send_template
+
+    receive_template['int'] = ('char $UNIQUE_0$[INT_BUFFER_SIZE];\n'
+                                '$RPC_SOCKET$->read($UNIQUE_0$, INT_BUFFER_SIZE);\n'
+                                '$PLACEHOLDER$ = atoi($UNIQUE_0$);\n'
+                                '*GRADING << "Received an INT named $PLACEHOLDER$ equal to " << $PLACEHOLDER$ << "." << endl;\n'
+                               )
+
+    receive_template['float'] = ('char $UNIQUE_0$[FLOAT_BUFFER_SIZE];\n'
+                                 '$RPC_SOCKET$->read($UNIQUE_0$, FLOAT_BUFFER_SIZE);\n'
+                                 '$PLACEHOLDER$ = (float)atof($UNIQUE_0$);\n'
+                                 '*GRADING << "Received a FLOAT named $PLACEHOLDER$ equal to " << $PLACEHOLDER$ << "." << endl;\n'
+                                )
+
+    receive_template['void'] = ('char $UNIQUE_0$[VOID_BUFFER_SIZE];\n'
+                                '$RPC_SOCKET$->read($UNIQUE_0$, VOID_BUFFER_SIZE);\n'
+                                '*GRADING << "Received a VOID." << endl;\n'
+                               )
+
+    receive_template['string'] = ('char $UNIQUE_0$[STRING_BUFFER_SIZE];\n'
+                                  'ssize_t $UNIQUE_1$;\n'
+                                  '$PLACEHOLDER$ = "";\n'
+                                  'while (true) {\n'
+                                  '$UNIQUE_1$ = $RPC_SOCKET$->read($UNIQUE_0$, STRING_BUFFER_SIZE);\n'
+                                  "if ($UNIQUE_1$ == 0 || $UNIQUE_0$[0] == '\\0') {\n"
+                                  '\tbreak;\n'
+                                  '}\n'
+                                  '$PLACEHOLDER$ += $UNIQUE_0$[0];\n'
+                                  '}\n'
+                                  '''*GRADING << "Received a STRING named $PLACEHOLDER$ equal to '" << $PLACEHOLDER$ << "'." << endl;\n'''
+                                 )
+    
+    send_template['int'] = ('char $UNIQUE_0$[INT_BUFFER_SIZE];\n'
+                            'snprintf($UNIQUE_0$, sizeof($UNIQUE_0$), "%d", $PLACEHOLDER$);\n'
+                            '$RPC_SOCKET$->write($UNIQUE_0$, INT_BUFFER_SIZE);\n'
+                            '*GRADING << "Sent an INT named $PLACEHOLDER$ equal to " << $PLACEHOLDER$ << "." << endl;\n'
+                           )
+
+    send_template['float'] = ('char $UNIQUE_0$[FLOAT_BUFFER_SIZE];\n'
+                              'snprintf($UNIQUE_0$, sizeof($UNIQUE_0$), "%40.40f", $PLACEHOLDER$);\n'
+                              '$RPC_SOCKET$->write($UNIQUE_0$, FLOAT_BUFFER_SIZE);\n'
+                              '*GRADING << "Sent an FLOAT named $PLACEHOLDER$ equal to " << $PLACEHOLDER$ << "." << endl;\n'
+                             )
+
+    send_template['void'] = ('$RPC_SOCKET$->write("1", VOID_BUFFER_SIZE);\n'
+                             "char $UNIQUE_0$ = 'A';\n"
+                             '(void)$UNIQUE_0$;\n'
+                             '*GRADING << "Sent a VOID." << endl;\n'
+                            )
+
+
+    send_template['string'] = ('$RPC_SOCKET$->write($PLACEHOLDER$.c_str(), $PLACEHOLDER$.length() + 1);\n'
+                               "char $UNIQUE_0$ = 'A';\n"
+                               '(void)$UNIQUE_0$;\n'
+                               "char $UNIQUE_1$ = 'A';\n"
+                               '(void)$UNIQUE_1$;\n'
+                               '''*GRADING << "Sent a STRING named $PLACEHOLDER$ equal to '" << $PLACEHOLDER$ << "'." << endl;\n'''
+                               )
+
+def create_custom_template_array(template, name, meta):
+    """ Creates templates for user defined arrays given which dictionary to add the 
+        template to as well as the name of the type and its meta information found
+        in the declarations.
+
+        In addition, it sets the number of locally unique placeholders in the type
+        to one plus the number of locally unique placeholders required for its
+        member type.
+    """
+    global receive_template
+    global send_template
+
+    s = ''
+    element_count = meta['element_count']
+    member_num_locally_unique = decls['types'][meta['member_type']]['num_locally_unique']
+
+    # Creates the string (for i = 0; i < element_count; i++) { EXCEPT that it
+    # uses a locally unique placeholder for the variable i as the name i might
+    # already been taken in the struct / another variable in the function.
+    s += 'for (int $UNIQUE_' + str(member_num_locally_unique) + '$=0; $UNIQUE_' + \
+         str(member_num_locally_unique) +'$ < ' + str(element_count) + '; $UNIQUE_' + \
+         str(member_num_locally_unique) +'$++) {\n'
+
+    # Get the template from the member type and then add the indexing of the array
+    # to the placeholder within the template.
+    sub = get_template(template, 'local', meta['member_type'], 0)
+    sub = sub.replace('$PLACEHOLDER$', '$PLACEHOLDER$[$UNIQUE_' + str(member_num_locally_unique) + '$]')
+
+    # Add the substring to the array template string and add its closing brace.
+    s += sub
+    s += '}\n'
+
+    # Add the template into its corresponding dictionary
+    if template == 'receive':
+        receive_template[name] = s
+    elif template == 'send':
+        send_template[name] = s
+
+    # Set the number of locally unique placeholders within this type in the declarations
+    decls['types'][name]['num_locally_unique'] = 1 + member_num_locally_unique
+
+def create_custom_template_struct(template, name, meta):
+    """ Creates templates for user defined structs given which dictionary to add the
+        template to as well as the name of the type and its meta information found in
+        the declarations.
+
+        In addition, it sets the number of locally unique placeholders in the type
+        to the sum of the locally unique placeholders required for each of the member
+        types within the struct.
+    """
+    global receive_template
+    global send_template
+
+    # n keeps track of the number of locally unique placeholders we have found
+    # at each step of the template creation. 
+    n = 0
+    # s keeps track of the final template.
+    s = ''
+
+    for member in meta['members']:
+        # For each of the members within the struct, get its local template
+        # given the number of locally unique placeholders we have accumulated
+        # so far (specified by n).
+        sub = get_template(template, 'local', member['type'], n)
+
+        # Then, augment the $PLACEHOLDER$ by adding the '.' to allow fo
+        # accessing the struct at the given member name.
+        sub = sub.replace('$PLACEHOLDER$', '$PLACEHOLDER$.' + member['name'])
+
+        # Finally, add the substring to the outermost struct string and
+        # add the number of locally unique placeholders within this member type
+        # to the count.
+        s += sub
+        n += decls['types'][member['type']]['num_locally_unique']
+
+
+    # Add the template into its corresponding dictionary
+    if template == 'receive':
+        receive_template[name] = s
+    elif template == 'send':
+        send_template[name] = s
+
+    # Set the number of locally unique placeholders within this type in the declarations
+    decls['types'][name]['num_locally_unique'] = n
+
+def create_custom_templates():
+    """ Creates send and receive templates for each of the user defined types
+        through the composition of existing templates.
+    """
+    global receive_template
+    global send_template
+    global decls
+
+    types = decls['types']
+
+    # This outer while loop will continue to iterate through until all
+    # types have been added to the templates. Because a valid IDL file
+    # must declare all types, it is impossible for this loop to fail
+    # to terminate.
+    while (True):
+        # This flag holds on to whether or not a type has had its templates
+        # added to the dictionaries during a round of the loop. Once no
+        # more templates have been added, the outer loop can be broken.
+        flag = False
+
+        # Process each name : meta information pair within the type list.
+        for name, meta in types.iteritems():
+
+            # If a name already exists in the template we do not need to
+            # add its information again and it may be skipped.
+            if name in receive_template:
+                continue
+            # In addition, skip any builtin types as they have already been
+            # initialized into the templates. This should have been caught
+            # by the check above it, but it can't hurt.
+            if meta['type_of_type'] == 'builtin':
+                continue
+
+            elif meta['type_of_type'] == 'array':
+                if meta['member_type'] not in receive_template:
+                    # We do not yet know how to process the member
+                    # type of this array so we will skip it until
+                    # the member type is defined
+                    continue
+                else:
+                    # Process an array by adding its template to both the
+                    # send and receive templates. Set the flag to True
+                    # as we have processed a type this round.
+                    create_custom_template_array('receive', name, meta)
+                    create_custom_template_array('send', name, meta)
+                    flag = True
+
+            elif meta['type_of_type'] == 'struct':
+                valid = True
+                for member in meta['members']:
+                    if member['type'] not in receive_template:
+                        # Much like the arrays, if we find that any member type
+                        # within the array has not yet been defined, we must 
+                        # skip the parent for now until the member
+                        # is defined.
+                        valid = False
+                if not valid:
+                    continue
+                else:
+                    # If the struct has all of its member types declared,
+                    # add its template into the send and receive dictionaries
+                    # and set the flag to True as we have processed a type
+                    # this round.
+                    create_custom_template_struct('receive', name, meta)
+                    create_custom_template_struct('send', name, meta)
+                    flag = True
+
+        # If the flag has not been set to True we have not found any extra
+        # types to process and we can stop looking for them as they
+        # have all been added to the template dictionaries.
+        if not flag:
+            break
+
+def instantiate(t, name):
+    """ Instantiates an object of the given type in C++ code. Since void types
+        cannot be instantiated, this function returns an empty string. For all
+        other types, the instantiated string is of the following form:
+
+        [underlying type] [name] [array closure]
+
+        For example, an int named x would be:
+
+        int x
+
+        The array closure keeps track of how many layers of arrays we have
+        found on our way to recursively finding the underlying type. For
+        example, a two-dimensional array of 10 Person (a struct) rows/columns 
+        named arr would be:
+
+        Person arr[10][10]
+    """
+    if t == 'void':
+        return ''
+    else:
+        # Begin the recursive check to find the underlying type starting
+        # with an empty array closure.
+        return instantiate_helper(t, name, '')
+
+def instantiate_helper(t, name, closure):
+    """ Recursively calculates the instantiated string of the given name and
+        type. If the type is a builtin or struct, create the instantiated
+        string. Otherwise, add the element count to the array closure and continue
+        searching for the underlying type (to support multiple levels of
+        arrays)
+    """
+
+    meta = decls['types'][t]
+
+    if meta['type_of_type'] == 'builtin' or meta['type_of_type'] == 'struct':
+        return t + ' ' + name + closure
+
+    elif meta['type_of_type'] == 'array':
+        # Add the brackets to the closure as well as the element 
+        # count to support arrays.
+        closure += '[' + str(meta['element_count']) + ']'
+        return instantiate_helper(meta['member_type'], name, closure)
+
+    # Corner case -- a badly formed IDL file with a type_of_type not
+    # equal to a builtin, array, or struct cannot be instantiated.
+    else:
+        return ''
+    
+
+def get_template(template, scope, name, n=0):
+    """ Gets a template from the given template dictionary in a specific
+        scope for a name. In addition, for resolving local templates, a
+        value for n may be specified to increment each $UNIQUE_N$ placeholder.
+
+        NOTE:
+            - template must be the string 'send' or 'receive'
+            
+            - scope must be the string 'local' or 'global'
+
+            - n will default to 0 if not specified. It is ignored
+              in the global scope.
+    """
+    global send_template
+    global receive_template
+
+    if scope == 'local':
+        # For resolving local templates, first get the template out of
+        # the corresponding dictionary.
+        s = ''
+        if template == 'send':
+            s = send_template[name]
+        elif template == 'receive':
+            s = receive_template[name]
+
+        # Then calculate the number of locally unique placeholders
+        # we will need for the given template
+        counter = decls['types'][name]['num_locally_unique']
+
+        for i in range(0, counter):
+            # Then, for each locally unique template of the form $UNIQUE_N$
+            # within the template, increment the number of the placeholder
+            # to $UNIQUE_M$, where M = N + n
+            a = '$UNIQUE_' + str(i) + '$'
+            b = '$UNIQUE_' + str((n + i)) + '$'
+            s = s.replace(a, b)
+
+        return s
+
+    elif scope == 'global':
+        # For resolving global templates, begin by getting the template out
+        # of the corresponding dictionary.
+        s = ''
+        if template == 'send':
+            s = send_template[name]
+        elif template == 'receive':
+            s = receive_template[name]
+
+        # counter keeps track of the number of locally unique placeholders
+        # we have found.
+        counter = 0
+        found = True
+
+        while (found):
+            # Scan through the template in order starting at 0 looking for
+            # any $UNIQUE_N$ placeholders. If we find a placeholder, replace
+            # it with a globally unique variable name using the 
+            # generate_unique_name() method and increment the counter.
+            #
+            # NOTE: Because of the invariant that locally unique placeholders
+            # always start at 0 and increment one by one, we can never skip
+            # a placeholder or miss one in a template.
+            local = '$UNIQUE_' + str(counter) + '$'
+            if local in s:
+                s = s.replace(local, generate_unique_name())
+                counter += 1
+            else:
+                # We are done if the locally unique placeholder string we have
+                # just calculated is not in the string.
+                found = False
+
+        return s
+
+def add_defaults(filename):
+    """ Add the default strings to the beginning of each of the proxy and stub
+        files to support all of the libraries #included and the namespaces we
+        use in addition to the IDL filename specified.
+
+        In addition, we add the logic to get a function name from a stream to
+        the stub in order to process the names sent by the proxy file. Note that
+        as declared in the stub footer for dispatch() the limit of a function
+        name is 2048 characters.
+    """
+    global proxy
+    global stub
+
+    # In this string we define the sizes used for the buffers to send all of
+    # the builtin types -- INT, FLOAT, VOID, and STRING.
+    #
+    # The INT buffer is set to 16 characters to support all 32 bit binary numbers
+    # represented in their decimal forms including the negative sign. This includes
+    # all numbers from -2^31 to 2^31-1.
+    #
+    # The FLOAT buffer is set to 128 characters to support all 32 bit floating point
+    # numbers in their decimal reprsentation. While according to wikipedia the
+    # maximum floating point number is 2^127 and the minimum is 2^-126 which each
+    # use fewer than 40 decimal digits, we decided to play it safe and pad a little
+    # extra space within the buffer. We figured the loss of precision with taking 
+    # the float and putting it into a buffer and back is more detrimental than
+    # any loss of precision with using only 40 places to the left and right 
+    # of the decimal point.
+    #
+    # The VOID buffer is set to 1 character to send a sentinel bit across the 
+    # network to specify that a void function is called.
+    #
+    # The STRING buffer is set to 1 character since we read strings byte
+    # by byte until a '\0' (null terminator) character is reached. Note that
+    # the STRING buffer is only used when receiving a string, since when
+    # they are written the buffer sign can be calculated by adding one
+    # to the size of the string.
+    
+    s = ('#include <string>\n'
+         '#include <cstdio>\n'
+         '#include <cstring>\n'
+         '#include <stdlib.h>\n'
+         '#include "rpcproxyhelper.h"\n'
+         '#include "rpcstubhelper.h"\n'
+         '#include "c150grading.h"\n'
+         '\n'
+         'using namespace std;\n'
+         'using namespace C150NETWORK;\n'
+         '\n'
+         '#include "{0}"\n'
+         '\n'
+         '#define INT_BUFFER_SIZE 16\n'
+         '#define FLOAT_BUFFER_SIZE 128\n'
+         '#define VOID_BUFFER_SIZE 1\n'
+         '#define STRING_BUFFER_SIZE 1\n'
+         '\n'
+         '\n'
+         )
+
+    s = s.format(filename)
+
+    proxy += s
+    stub += s
+
+
+    # We leveraged Noah's getFunctionNameFromStream function to read each
+    # function name byte by bye from the stream and return it to the user.
+    # We only support function names up to 2048 characters.
+    s = ('void getFunctionNameFromStream(char *buffer, unsigned int bufSize) {\n'
+         'unsigned int i;\n'
+         'char *bufp;\n'
+         'ssize_t readlen;\n\n'
+         'bufp = buffer;\n'
+         'for (i=0; i< bufSize; i++) {\n'
+         '    readlen = RPCSTUBSOCKET-> read(bufp, 1);\n'
+         '    // check for eof or error\n'
+         '    if (readlen == 0) {\n'
+         '      break;\n'
+         '    }\n'
+         '    // check for null and bump buffer pointer\n'
+         "    if (*bufp++ == '\\0') {\n"
+         '      break;\n'
+         '    }\n'
+         '  }\n'
+         '}\n\n'
+         )
+
+    # Only add the function name logic to the stub as it is not used
+    # by the proxy.
+    stub += s
+
+def generate_functions():
+    """
+    Generate the body of the proxy and stub files: their functions.
+    """
+    global decls
+
+    for name, sig in decls['functions'].iteritems():
+        generate_proxy_function(name, sig)
+        generate_stub_function(name, sig)
+
+def generate_stub_function(name, sig):
+    """
+    Generate the stub code for a specific function using our templating system
+    to send/receive each required value.
+    """
+    global stub
+
+    args = sig['arguments']
+
+    # write the function signature
+    stub += 'void ' + sig['unique_name'] + '() {\n'
+
+    stub += '*GRADING << "Proceeding with invocation of ' + name + '()." << endl;\n'
+    
+    # for each argument that we will need to receive, generate the receiving code
+    # from the templates
+    for a in args:
+        s = instantiate(a['type'], '$PLACEHOLDER$')
+        if (s != ''):
+            s += ';\n'
+        s += get_template('receive', 'global', a['type'])
+        s = s.replace('$PLACEHOLDER$', a['name'])
+        s = s.replace('$RPC_SOCKET$', 'RPCSTUBSOCKET')
+        s = format_grading(s)
+
+        stub += s
+        stub += '\n'
+
+    # declare the return variable (if we need one) and then call the requested
+    # function with the arguments that we received above.
+    ret_name = generate_unique_name()
+    s = instantiate(sig['return_type'], ret_name)
+    if s != '':
+        s += ';\n'
+        s += ret_name + ' = ' + name + '(' + ', '.join([a['name'] for a in args]) + ');\n'
+    else:
+        s += name + '(' + ', '.join([a['name'] for a in args]) + ');\n'
+
+    stub += s
+
+    # send the returned value back to the proxy
+    s = get_template('send', 'global', sig['return_type'])
+    s = s.replace('$PLACEHOLDER$', ret_name)
+    s = s.replace('$RPC_SOCKET$', 'RPCSTUBSOCKET')
+
+    s += '*GRADING << "Invocation of ' + name + '() ended." << endl;\n'
+
+    s += '}\n\n'
+
+    stub += s
+
+
+
+def generate_proxy_function(name, sig):
+    """
+    Generate the proxy code for a specific function using our templating system
+    to send/receive each required value.
+    """
+    global proxy
+
+    args = sig['arguments']
+   
+    # generate the function signature
+    argstring = ', '.join([instantiate(a['type'], a['name']) for a in args])
+    proxy += sig['return_type'] + ' ' + name + ' (' + argstring + ') {\n'
+
+    proxy += '*GRADING << "Proceeding with invocation of ' + name + '()." << endl;\n'
+
+    # request a call to this function
+    proxy += '\nRPCPROXYSOCKET->write("' + name + '", strlen("' + name + '") + 1);\n\n'
+
+    # generate the code for sending each argument
+    for a in args:
+        s = get_template('send', 'global', a['type'])
+        s = s.replace('$PLACEHOLDER$', a['name'])
+        s = s.replace('$RPC_SOCKET$', 'RPCPROXYSOCKET')
+        s = format_grading(s)
+
+        proxy += s
+        proxy += '\n'
+
+    # declare the return variable
+    ret_name = generate_unique_name()
+    s = instantiate(sig['return_type'], ret_name)
+
+    # For functions that do not  voids, add a semi-colon and
+    # a new line to the instantiated return type.
+    if s != '':
+        s += ';\n'
+    s += get_template('receive', 'global', sig['return_type'])
+    s = s.replace('$PLACEHOLDER$', ret_name)
+    s = s.replace('$RPC_SOCKET$', 'RPCPROXYSOCKET')
+
+    proxy += s
+
+    proxy += '*GRADING << "Invocation of ' + name + '() ended." << endl;\n'
+
+    # return the return variable if necessary
+    if sig['return_type'] != 'void':
+        proxy += '\nreturn ' + ret_name + ';\n'
+
+
+    proxy += '\n}\n\n'
+
+def format_grading(s):
+    """
+    When we include grading logs in our generated code, we need to do some
+    special formatting to properly display array indices. Without this code, a
+    grading log of an array cell's transmission would refer to 'a[var1][var2]'
+    instead of'a[0][0]' like we want. The following code makes sure we print the
+    actual array indices and not the iterator variable names.
+    """
+    # get the location of the grading log substring within the template string
+    start = s.find('*GRADING')
+    end   = s.find('equal to', start)
+    change = s[start:end]
+
+    # make the replacement
+    change = change.replace('[', '[" << ')
+    change = change.replace(']', ' << "]')
+
+    # splice back in the newly formatted grading log
+    s = s[:start] + change + s[end:]
+    return s
+
+def add_stub_footer():
+    """
+    Add boilerplate code to the bottom of the stub file. This code is used to
+    read in which function names are being requested and call their
+    appropriate alias function.
+    """
+    global stub
+
+    s = ('void dispatchFunction() {\n'
+         '\n'
+         'char functionNameBuffer[2048];\n'
+         'getFunctionNameFromStream(functionNameBuffer, sizeof(functionNameBuffer));\n'
+         'if (!RPCSTUBSOCKET->eof()) {\n'
+        )
+
+    for name, sig in decls['functions'].iteritems():
+        s += ('if (strcmp(functionNameBuffer, "' + name + '") == 0)\n'
+              '\t' + sig['unique_name'] + '();\n'
+             )
+
+    s += '}\n'
+    s += '}\n\n'
+
+    stub += s
+
+def augment_empty_structs():
+    """
+    Add a void member to empty structs.
+    As noted in the report html, empty structs require special handling due to
+    our transmission strategy. We add a void member to each empty struct, which
+    functions as an acknowledgement of work between the client and server. Refer
+    to the report for a deeper explanation.
+    """
+    for name, meta in decls['types'].iteritems():
+        if meta['type_of_type'] == 'struct' and len(meta['members']) == 0:
+            meta['members'].append({'name':'ACK', 'type':'void'})
+            meta['num_locally_unique'] = 1
+
+def write_files(filename):
+    """
+    Write the generated stub and proxy files to disk, overwriting existing files
+    of the same names.
+    """
+    name = filename.split('.')[0]
+
+    stub_file = open(name + '.stub.cpp', 'w')
+    stub_file.write(stub)
+    stub_file.close()
+
+    proxy_file = open(name + '.proxy.cpp', 'w')
+    proxy_file.write(proxy)
+    proxy_file.close()
+
+def assign_unique_function_names():
+    """
+    For all declared functions, generate unique names that may be safely used as
+    aliases for them. We must store these unique names for repeated use, so we
+    add them to the declaration within the decls dictionary. These are used 
+    when building the stub file.
+    """
+    for name, sig in decls['functions'].iteritems():
+        sig['unique_name'] = generate_unique_name()
+
+def generate_unique_name():
+    """
+    Generates and returns a name that is guaranteed to be unique within a
+    template. We accomplish this by using a global counter to track what names
+    we have already used, and by checking that the name does not already exist
+    within the .idl's declarations (to prevent the generated names from
+    conflicting with ay ny user-defined names.)
+    """
+    global counter
+    global decls_str
+
+    s = "var" + str(counter)
+    counter += 1
+    while s in decls_str:
+        s = "var" + str(counter)
+        counter += 1
+
+    return s
+
+if __name__ == "__main__":
+    main()
